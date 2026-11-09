@@ -177,7 +177,8 @@
   // 第一层消除手抖，第二层整理弧线曲率；不跨拐点读取未来轨迹，因此不会平均成飘带。
   function smoothPointsStabilized(points,level,live=false,brushSize=1){
     if(level<=1||points.length<3)return points.slice();
-    const strength=clamp((level-1)/99,0,1),primaryFollow=1-.86*Math.pow(strength,.68),curveFollow=1-.72*Math.pow(strength,.82),maxLag=Math.max(2,Math.min(24,brushSize*.08+strength*16));
+    // 将旧版 100 档的有效强度前移到约 50 档，50-100 继续进入更强的弧线稳定区间。
+    const strength=clamp((level-1)/99,0,1),power=strength*2,primaryFollow=clamp(1-.86*Math.pow(power,.68),.1,1),curveFollow=clamp(1-.72*Math.pow(power,.82),.2,1),lagRange=brushSize*.08+16*Math.min(power,1)+36*Math.max(0,power-1),maxLag=Math.max(2,Math.min(60,lagRange));
     const out=[{...points[0]}];let primary={...points[0]},filtered={...points[0]};
     for(let i=1;i<points.length;i++){
       const raw=points[i];
@@ -197,7 +198,8 @@
   // 逻辑2：速度自适应滤波。慢速抑制抖动，快速/急转弯立即提高跟随。
   function smoothPointsAdaptive(points,level,live=false,brushSize=1){
     if(level<=1||points.length<3)return points.slice();
-    const strength=clamp((level-1)/99,0,1),minCutoff=22*(1-strength)+1.4*strength,beta=.004+.006*strength,minLeg=Math.max(3,brushSize*.05),cornerThreshold=(55-15*strength)*Math.PI/180;
+    // 前半段覆盖旧版全部平滑范围；后半段继续降低高速放行量，并只让真正的尖角触发贴回。
+    const strength=clamp((level-1)/99,0,1),power=strength*2,minCutoff=power<=1?22*Math.pow(1.4/22,power):1.4*Math.pow(.45/1.4,power-1),beta=power<=1?.004+.006*power:.01*Math.pow(.0015/.01,power-1),minLeg=Math.max(3,brushSize*.05),cornerDegrees=power<=1?55-15*power:40+15*(power-1),cornerThreshold=cornerDegrees*Math.PI/180;
     const out=[{...points[0]}];let filtered={...points[0]},speedAvg=0;
     for(let i=1;i<points.length;i++){
       const raw=points[i],prevRaw=points[i-1],dt=clamp(((raw.t??i*16)-(prevRaw.t??(i-1)*16))/1000,.008,.05),rawSpeed=distance(prevRaw,raw)/dt;speedAvg+=.18*(rawSpeed-speedAvg);
