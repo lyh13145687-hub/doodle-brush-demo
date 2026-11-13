@@ -102,7 +102,7 @@
   const layers={tailSafe:makeCanvas(W,H)};
   const committedLayers={tailSafe:makeCanvas(W,H)};
   const background=makeCanvas(W,H);
-  const state={dpr:1,size:86,spacing:.12,turnDelay:.55,smoothing:45,smoothingLogic:2,opacity:1,modeOpacity:{serrated:1,texture:.8},modeColor:{serrated:'#fe9ed3',texture:'#c1dce6'},brushMode:'serrated',hardness:100,color:'#fe9ed3',tip:'default',tool:'brush',zoom:1,strokes:[],redoStack:[],active:null,source:null,view:new Map(),pointers:new Map(),pinch:null,holdTimer:null};
+  const state={dpr:1,size:86,spacing:.12,turnDelay:.55,smoothing:45,smoothingLogic:2,opacity:1,modeOpacity:{serrated:1,texture:.8},modeColor:{serrated:'#fe9ed3',texture:'#c1dce6'},brushMode:'serrated',hardness:100,color:'#fe9ed3',tip:'default',tool:'brush',zoom:1,strokes:[],redoStack:[],active:null,source:null,view:new Map(),pointers:new Map(),pinch:null,holdTimer:null,renderFrame:null};
   const resourceState={
     texture:{source:null,render:null,seamless:false,selectedSrc:defaultTextureSrc},
     pattern:{source:null,render:null,seamless:false,selectedSrc:defaultPatternSrc},
@@ -112,6 +112,7 @@
   const headCoverage={round:null,square:null,soft:null,flat:null,feather:null};
   const centerProfiles={round:null,square:null,soft:null,flat:null,feather:null};
   const defaultBrushCache=new Map();
+  const profileBandCache=new WeakMap();
   let stars=[],canvasPhoto=null;
 
   for(const [key,src] of Object.entries(embeddedAssets))document.querySelectorAll(`[data-asset="${key}"]`).forEach(img=>{img.src=src});
@@ -176,6 +177,13 @@
     x.putImageData(data,0,0);return c;
   }
 
+  // 实时笔画只在自身包围区域内生成覆盖率，避免每次移动都扫描整张 900×1200 画布。
+  function makeCoverageRegion(points,size){
+    const pad=Math.max(4,size*.62),minX=Math.max(0,Math.floor(Math.min(...points.map(p=>p.x))-pad)),minY=Math.max(0,Math.floor(Math.min(...points.map(p=>p.y))-pad)),maxX=Math.min(W,Math.ceil(Math.max(...points.map(p=>p.x))+pad)),maxY=Math.min(H,Math.ceil(Math.max(...points.map(p=>p.y))+pad));
+    const coverage=makeCanvas(Math.max(1,maxX-minX),Math.max(1,maxY-minY)),ctx=coverage.getContext('2d');ctx.fillStyle='#000';ctx.fillRect(0,0,coverage.width,coverage.height);ctx.globalCompositeOperation='lighten';ctx.translate(-minX,-minY);return{coverage,ctx,x:minX,y:minY};
+  }
+  function finishCoverageRegion(region){const cropped=coverageToAlpha(region.coverage),mask=makeCanvas(W,H);mask.getContext('2d').drawImage(cropped,region.x,region.y);return mask}
+
   function makeDefaultBrush(hardness){
     const key=Math.round(clamp(hardness,0,100));if(defaultBrushCache.has(key))return defaultBrushCache.get(key);
     const mask=makeCanvas(256,256),x=mask.getContext('2d',{willReadFrequently:true}),data=x.createImageData(256,256),radius=127.5,hardRadius=radius*(.28+.72*key/100);
@@ -198,10 +206,37 @@
     else ctx.rect(-overlap,-size/2,size/2+overlap,size);
     ctx.clip();ctx.drawImage(head,-size/2,-size/2,size,size);ctx.restore();
   }
-  function stampProfile(ctx,p,theta,size,length,tip,hardness){const profile=getBrush(tip,hardness).profile;if(!profile)return;ctx.save();ctx.translate(p.x,p.y);ctx.rotate(theta);ctx.drawImage(profile,-length/2,-size/2,length,size);ctx.restore()}
+  function getProfileBands(profile){
+    if(profileBandCache.has(profile))return profileBandCache.get(profile);
+    const x=profile.getContext('2d',{willReadFrequently:true}),data=x.getImageData(0,0,1,profile.height).data,bands=[];
+    // 用多层等值线描边还原 PNG 中央截面的透明度；每层都使用 bevel join，转角不会叠成圆点。
+    for(const level of [...Array.from({length:15},(_,i)=>(i+1)*16),255]){
+      let start=-1;
+      for(let y=0;y<=profile.height;y++){
+        const inside=y<profile.height&&data[y*4]>=level;
+        if(inside&&start<0)start=y;
+        if(!inside&&start>=0){bands.push({level,start,end:y});start=-1}
+      }
+    }
+    profileBandCache.set(profile,bands);return bands;
+  }
+  function drawProfileRibbon(ctx,points,size,tip,hardness){
+    const profile=getBrush(tip,hardness).profile;if(!profile||points.length<2)return;
+    const samples=resample(points,clamp(size*.055,.65,2.4)),h=profile.height,closed=distance(points[0],points.at(-1))<2;
+    for(const band of getProfileBands(profile)){
+      const width=Math.max(.35,(band.end-band.start)/h*size),offset=((band.start+band.end)/2/h-.5)*size;
+      ctx.beginPath();
+      for(let i=0;i<samples.length;i++){
+        const theta=i===0?direction(samples[0],samples[1]):i===samples.length-1?direction(samples[i-1],samples[i]):direction(samples[i-1],samples[i+1]);
+        const x=samples[i].x-Math.sin(theta)*offset,y=samples[i].y+Math.cos(theta)*offset;
+        if(i)ctx.lineTo(x,y);else ctx.moveTo(x,y);
+      }
+      if(closed)ctx.closePath();
+      ctx.lineWidth=width;ctx.lineJoin='bevel';ctx.lineCap='butt';ctx.strokeStyle=`rgb(${band.level},${band.level},${band.level})`;ctx.stroke();
+    }
+  }
   function buildRoundBrushMask(points,size,hardness){
-    const coverage=makeCanvas(W,H),c=coverage.getContext('2d');c.fillStyle='#000';c.fillRect(0,0,W,H);c.globalCompositeOperation='lighten';
-    const samples=points.length===1?points:resample(points,Math.max(.5,size*.025));samples.forEach(p=>stampCoverageHead(c,p,0,size,'default',hardness));return coverageToAlpha(coverage);
+    const region=makeCoverageRegion(points,size),samples=points.length===1?points:resample(points,Math.max(.75,size*.025));samples.forEach(p=>stampCoverageHead(region.ctx,p,0,size,'default',hardness));return finishCoverageRegion(region);
   }
   function resample(points,gap){
     if(points.length<2)return points.slice();const out=[points[0]];let remaining=gap;
@@ -228,29 +263,29 @@
       if(lag>maxLag){const pull=(lag-maxLag)/lag;filtered={...filtered,x:filtered.x+(raw.x-filtered.x)*pull,y:filtered.y+(raw.y-filtered.y)*pull}}
       out.push({...filtered});
     }
-    // 只用很短的末端过渡接回实时笔尖，避免把整段轨迹拉向最后一个点。
-    const tailCount=live?4:3,tailStart=Math.max(1,out.length-tailCount);
-    for(let i=tailStart;i<out.length;i++){const t=(i-tailStart+1)/(out.length-tailStart),blend=t*t;out[i]={...out[i],x:out[i].x+(points[i].x-out[i].x)*blend,y:out[i].y+(points[i].y-out[i].y)*blend}}
-    out[0]={...points[0]};out[out.length-1]={...points.at(-1)};
+    // 不再把实时末端强行贴回原始点；否则该点在下一帧会重新参与滤波，造成尾段跳变。
+    out[0]={...points[0]};
     return out;
   }
 
   // 逻辑2：速度自适应滤波。慢速抑制抖动，快速/急转弯立即提高跟随。
   function smoothPointsAdaptive(points,level,live=false,brushSize=1){
     if(level<=1||points.length<3)return points.slice();
-    // 前半段覆盖旧版全部平滑范围；后半段继续降低高速放行量，并只让真正的尖角触发贴回。
-    const strength=clamp((level-1)/99,0,1),power=strength*2,minCutoff=power<=1?22*Math.pow(1.4/22,power):1.4*Math.pow(.45/1.4,power-1),beta=power<=1?.004+.006*power:.01*Math.pow(.0015/.01,power-1),minLeg=Math.max(3,brushSize*.05),cornerDegrees=power<=1?55-15*power:40+15*(power-1),cornerThreshold=cornerDegrees*Math.PI/180;
-    const out=[{...points[0]}];let filtered={...points[0]},speedAvg=0;
+    // 只读取当前及历史点。转弯时连续提高跟随率，不再硬切到原始点，也不读取未来点。
+    const strength=clamp((level-1)/99,0,1),power=strength*2,minCutoff=power<=1?22*Math.pow(1.4/22,power):1.4*Math.pow(.55/1.4,power-1),beta=power<=1?.004+.006*power:.01*Math.pow(.002/.01,power-1),cornerThreshold=(power<=1?52-14*power:38+10*(power-1))*Math.PI/180,maxLag=Math.max(2,Math.min(34,brushSize*(.55-.2*strength)));
+    const out=[{...points[0]}];let filtered={...points[0]},speedAvg=0,cornerResponse=0;
     for(let i=1;i<points.length;i++){
       const raw=points[i],prevRaw=points[i-1],dt=clamp(((raw.t??i*16)-(prevRaw.t??(i-1)*16))/1000,.008,.05),rawSpeed=distance(prevRaw,raw)/dt;speedAvg+=.18*(rawSpeed-speedAvg);
-      const span=Math.min(5,i,points.length-1-i);let corner=false;
-      if(span>0){const a=points[i-span],b=raw,c=points[i+span],ab=distance(a,b),bc=distance(b,c);if(ab>=minLeg&&bc>=minLeg){const ux=(b.x-a.x)/ab,uy=(b.y-a.y)/ab,vx=(c.x-b.x)/bc,vy=(c.y-b.y)/bc,turn=Math.acos(clamp(ux*vx+uy*vy,-1,1));corner=turn>=cornerThreshold}}
-      if(corner){filtered={...raw};speedAvg=rawSpeed}
-      else{const cutoff=minCutoff+beta*speedAvg,alpha=1-Math.exp(-2*Math.PI*cutoff*dt);filtered={...raw,x:filtered.x+(raw.x-filtered.x)*alpha,y:filtered.y+(raw.y-filtered.y)*alpha}}
-      if(live){const tailStart=Math.max(1,points.length-5),tailBlend=clamp((i-tailStart)/Math.max(1,points.length-1-tailStart),0,1);if(tailBlend>0)filtered={...filtered,x:filtered.x+(raw.x-filtered.x)*tailBlend*tailBlend,y:filtered.y+(raw.y-filtered.y)*tailBlend*tailBlend}}
+      let turn=0;if(i>=2){const a=points[i-2],ab=distance(a,prevRaw),bc=distance(prevRaw,raw);if(ab>.5&&bc>.5){const ux=(prevRaw.x-a.x)/ab,uy=(prevRaw.y-a.y)/ab,vx=(raw.x-prevRaw.x)/bc,vy=(raw.y-prevRaw.y)/bc;turn=Math.acos(clamp(ux*vx+uy*vy,-1,1))}}
+      const cutoff=minCutoff+beta*speedAvg,baseAlpha=1-Math.exp(-2*Math.PI*cutoff*dt),cornerStart=cornerThreshold*.35,cornerMix=clamp((turn-cornerStart)/Math.max(.001,cornerThreshold-cornerStart),0,1),cornerEase=cornerMix*cornerMix*(3-2*cornerMix);
+      // 急转弯的响应分散到连续数个点，避免单点从高平滑突然跳回原始轨迹。
+      cornerResponse+=(cornerEase-cornerResponse)*(cornerEase>cornerResponse?.34:.22);
+      const alpha=baseAlpha+(1-baseAlpha)*cornerResponse*.38;
+      filtered={...raw,x:filtered.x+(raw.x-filtered.x)*alpha,y:filtered.y+(raw.y-filtered.y)*alpha};
+      const lag=distance(filtered,raw);if(lag>maxLag){const pull=(lag-maxLag)/lag;filtered={...filtered,x:filtered.x+(raw.x-filtered.x)*pull,y:filtered.y+(raw.y-filtered.y)*pull}}
       out.push({...filtered});
     }
-    out[0]={...points[0]};out[out.length-1]={...points.at(-1)};
+    out[0]={...points[0]};
     return out;
   }
 
@@ -313,27 +348,12 @@
   function shortestAngleDelta(from,to){let d=(to-from)%(Math.PI*2);if(d>Math.PI)d-=Math.PI*2;if(d<-Math.PI)d+=Math.PI*2;return d}
 
   function buildProfileMask(points,size,endpointMode='full',tip=state.tip,hardness=state.hardness){
-    const coverage=makeCanvas(W,H),c=coverage.getContext('2d');
-    c.fillStyle='#000';c.fillRect(0,0,W,H);c.globalCompositeOperation='lighten';
-    if(points.length===1){stampCoverageHead(c,points[0],0,size,tip,hardness);return coverageToAlpha(coverage)}
-    const gap=Math.max(2,size*.035),stripLength=Math.max(8,size*.16),samples=resample(points,gap);
-    for(let i=0;i<samples.length;i++){
-      const theta=i===0?direction(samples[0],samples[1]):direction(samples[i-1],samples[i]);
-      stampProfile(c,samples[i],theta,size,stripLength,tip,hardness);
-    }
-    // 在折点补齐截面的转向扇面；每一步不超过 6°。
-    for(let i=1;i<points.length-1;i++){
-      const incoming=direction(points[i-1],points[i]),outgoing=direction(points[i],points[i+1]),delta=shortestAngleDelta(incoming,outgoing);
-      const steps=Math.max(1,Math.ceil(Math.abs(delta)/(Math.PI/30)));
-      for(let s=0;s<=steps;s++)stampProfile(c,points[i],incoming+delta*s/steps,size,stripLength,tip,hardness);
-    }
-    if(endpointMode==='body'&&distance(points[0],points.at(-1))<2){
-      const incoming=direction(points.at(-2),points[0]),outgoing=direction(points[0],points[1]),delta=shortestAngleDelta(incoming,outgoing),steps=Math.max(1,Math.ceil(Math.abs(delta)/(Math.PI/30)));
-      for(let s=0;s<=steps;s++)stampProfile(c,points[0],incoming+delta*s/steps,size,stripLength,tip,hardness);
-    }
+    const region=makeCoverageRegion(points,size),c=region.ctx;
+    if(points.length===1){stampCoverageHead(c,points[0],0,size,tip,hardness);return finishCoverageRegion(region)}
+    drawProfileRibbon(c,points,size,tip,hardness);
     const firstTheta=direction(points[0],points[1]),lastTheta=direction(points.at(-2),points.at(-1));
     if(endpointMode==='body'){
-      return coverageToAlpha(coverage);
+      return finishCoverageRegion(region);
     }else if(endpointMode==='clipped'){
       stampClippedCoverageHead(c,points[0],firstTheta,size,-1,tip,hardness);
       stampClippedCoverageHead(c,points.at(-1),lastTheta,size,1,tip,hardness);
@@ -341,7 +361,7 @@
       stampCoverageHead(c,points[0],firstTheta,size,tip,hardness);
       stampCoverageHead(c,points.at(-1),lastTheta,size,tip,hardness);
     }
-    return coverageToAlpha(coverage);
+    return finishCoverageRegion(region);
   }
 
 
@@ -356,7 +376,7 @@
     let mask;
     if(tip==='default')mask=buildRoundBrushMask(points,size,hardness);
     else if(closedShape)mask=buildProfileMask(points,size,'body',tip,hardness);
-    else mask=buildProfileMask(points,size,'clipped',tip,hardness);
+    else mask=buildProfileMask(points,size,'full',tip,hardness);
 
     const paint=makeCanvas(W,H),p=paint.getContext('2d'),brushMode=stroke.brushMode??'serrated';
     if(brushMode==='texture'){
@@ -382,6 +402,8 @@
   function composeLayers(){
     for(const mode of MODES){const x=layers[mode].getContext('2d');x.clearRect(0,0,W,H);x.drawImage(committedLayers[mode],0,0);if(state.active)renderStroke(x,state.active,mode,true)}drawAll();
   }
+  function requestComposeLayers(){if(state.renderFrame!==null)return;state.renderFrame=requestAnimationFrame(()=>{state.renderFrame=null;composeLayers()})}
+  function cancelScheduledCompose(){if(state.renderFrame===null)return;cancelAnimationFrame(state.renderFrame);state.renderFrame=null}
   function rebuildLayers(){
     for(const mode of MODES){const x=committedLayers[mode].getContext('2d');x.clearRect(0,0,W,H);state.strokes.forEach(s=>renderStroke(x,s,mode))}composeLayers();updateHistoryUI();
   }
@@ -405,7 +427,7 @@
   function toImage(canvas,cx,cy){const r=canvas.getBoundingClientRect(),v=getView(canvas);return{x:(cx-r.left-v.x)/v.scale,y:(cy-r.top-v.y)/v.scale}}
 
   function pointerDown(e){
-    const c=e.currentTarget;c.setPointerCapture(e.pointerId);state.pointers.set(e.pointerId,{x:e.clientX,y:e.clientY,canvas:c});
+    const c=e.currentTarget;cancelScheduledCompose();c.setPointerCapture(e.pointerId);state.pointers.set(e.pointerId,{x:e.clientX,y:e.clientY,canvas:c});
     if(state.pointers.size===2){const q=[...state.pointers.values()];state.pinch=distance(q[0],q[1]);state.active=null;rebuildLayers();return}
     const p={...toImage(c,e.clientX,e.clientY),t:e.timeStamp};if(p.x<0||p.y<0||p.x>W||p.y>H)return;state.source=c;state.active={size:state.size,smoothing:state.smoothing,smoothingLogic:state.smoothingLogic,opacity:state.opacity,color:state.color,brushMode:state.brushMode,textureImage:resourceState.texture.render,patternImage:resourceState.pattern.render,autoPatternColor:resourceState.autoPatternColor,tool:state.tool,tip:state.tool==='erase'?'default':state.tip,hardness:state.hardness,points:[p],rawPoints:[p],lastPointer:{...p},shapeLocked:false};clearTimeout(state.holdTimer);state.holdTimer=null;composeLayers();
   }
@@ -414,10 +436,11 @@
     if(state.pointers.size===2){const q=[...state.pointers.values()],d=distance(q[0],q[1]);if(state.pinch){state.zoom=clamp(state.zoom*d/state.pinch,1,4);drawAll()}state.pinch=d;return}
     if(!state.active||state.source!==e.currentTarget)return;const latest={...toImage(e.currentTarget,e.clientX,e.clientY),t:e.timeStamp};if(state.active.shapeLocked){resizeLockedShape(state.active,latest);composeLayers();return}
     const coalesced=typeof e.getCoalescedEvents==='function'?e.getCoalescedEvents():[],events=coalesced.length?coalesced:[e];let changed=false;
-    for(const sample of events){const p={...toImage(e.currentTarget,sample.clientX,sample.clientY),t:sample.timeStamp};if(distance(state.active.lastPointer,p)<=1.25)continue;state.active.lastPointer={...p};if(distance(state.active.points.at(-1),p)>Math.max(1,state.size*.02)){state.active.points.push(p);state.active.rawPoints.push(p);changed=true}}
-    if(!changed)return;clearTimeout(state.holdTimer);state.holdTimer=null;composeLayers();if(state.active.tool!=='erase')scheduleShapeRecognition();
+    const minGap=clamp(state.size*.025,1.5,3.5);
+    for(const sample of events){const p={...toImage(e.currentTarget,sample.clientX,sample.clientY),t:sample.timeStamp};if(distance(state.active.lastPointer,p)<=minGap)continue;state.active.lastPointer={...p};if(distance(state.active.points.at(-1),p)>minGap){state.active.points.push(p);state.active.rawPoints.push(p);changed=true}}
+    if(!changed)return;clearTimeout(state.holdTimer);state.holdTimer=null;requestComposeLayers();if(state.active.tool!=='erase')scheduleShapeRecognition();
   }
-  function pointerEnd(e){state.pointers.delete(e.pointerId);state.pinch=null;clearTimeout(state.holdTimer);state.holdTimer=null;if(state.active){state.strokes.push(state.active);state.redoStack=[];state.active=null;rebuildLayers()}}
+  function pointerEnd(e){state.pointers.delete(e.pointerId);state.pinch=null;clearTimeout(state.holdTimer);state.holdTimer=null;cancelScheduledCompose();if(state.active){state.strokes.push(state.active);state.redoStack=[];state.active=null;rebuildLayers()}}
   for(const c of Object.values(canvases)){c.addEventListener('pointerdown',pointerDown);c.addEventListener('pointermove',pointerMove);c.addEventListener('pointerup',pointerEnd);c.addEventListener('pointercancel',pointerEnd);c.addEventListener('contextmenu',e=>e.preventDefault());c.addEventListener('wheel',e=>{e.preventDefault();state.zoom=clamp(state.zoom*Math.exp(-e.deltaY*.001),1,4);drawAll()},{passive:false})}
 
   document.querySelector('#size').addEventListener('input',e=>{state.size=+e.target.value;document.querySelector('#sizeText').textContent=e.target.value});
